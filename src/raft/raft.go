@@ -10,6 +10,13 @@ import (
 	"../labrpc"
 )
 
+func min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+
 // ApplyMsg : as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -26,11 +33,21 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// LogEntry to be commited to the log
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
 // AppendEntryArgs is sent to peers by the leader to initate the commit of a new log entry
 // or periodically as a heartbeat
 type AppendEntryArgs struct {
-	Term     int
-	LeaderID int
+	Term         int
+	LeaderID     int
+	PrevLogIndex int         // index of log entry immediately preceding new ones
+	PrevLogTerm  int         // term of prevLogIndex entry
+	Entries      []*LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int         // leader’s commitIndex
 }
 
 // AppendEntryReply is filled in by peers to inform the leader that they have received a new log entry
@@ -42,8 +59,10 @@ type AppendEntryReply struct {
 // RequestVoteArgs are passed to the RequestVote RPC method
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateID int
+	Term         int
+	CandidateID  int
+	LastLogIndex int // index of candidate’s last log entry
+	LastLogTerm  int // term of candidate’s last log entry
 }
 
 // RequestVoteReply is filled in by the RequestVote RPC method
@@ -60,17 +79,26 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	term      int                 // latest term server has seen (initialized to 0 on first boot, increases monotonically)
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// LOG and metadata
+	log         []*LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	commitIndex int         // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int         // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+	// ELECTION state
 	electionTimeout     time.Duration // Timeout for leader heartbeat. Calls for election if timeout reached
 	lastHeardFromLeader time.Time     // Time since the last AppendEntry message has arrived from the leader
+	votedFor            int           // candidateId that received vote in current term (or null if none)
 
-	term     int  // latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor int  // candidateId that received vote in current term (or null if none)
-	isLeader bool // whether this peer thinks it's the leader of a cluster
+	// LEADER state
+	isLeader   bool  // whether this peer thinks it's the leader of a cluster
+	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leaderlast log index + 1)
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 }
 
 // Write locked access methods
@@ -130,18 +158,6 @@ func (rf *Raft) shouldCallElection() (bool, time.Duration) {
 	elapsed := t.Sub(rf.lastHeardFromLeader)
 
 	return elapsed < rf.electionTimeout || rf.isLeader, elapsed
-}
-
-func (rf *Raft) shouldGrantVote(args *RequestVoteArgs) bool {
-	rf.mu.RLock()
-	defer rf.mu.RUnlock()
-
-	termIsCurrent := !(args.Term < rf.term)
-	noConflictingVotes := rf.votedFor == -1 || rf.votedFor == args.CandidateID
-
-	shouldGrantVote := termIsCurrent && noConflictingVotes
-
-	return shouldGrantVote
 }
 
 // GetState returns public state information
@@ -219,6 +235,19 @@ func (rf *Raft) RequestVote(message *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
+func (rf *Raft) shouldGrantVote(args *RequestVoteArgs) bool {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+
+	termIsCurrent := !(args.Term < rf.term)
+	noConflictingVotes := rf.votedFor == -1 || rf.votedFor == args.CandidateID
+	hasCurrentLog := rf.lastApplied <= args.LastLogIndex
+
+	shouldGrantVote := termIsCurrent && noConflictingVotes && hasCurrentLog
+
+	return shouldGrantVote
+}
+
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, resultCh chan bool) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
@@ -234,7 +263,11 @@ func (rf *Raft) AppendEntry(message *AppendEntryArgs, reply *AppendEntryReply) {
 	// Your code here (2A, 2B).
 	rf.resetElectionTimeout()
 	rf.maybeJoinFutureTerm(message.Term)
-	term, _ := rf.GetState()
+
+	rf.mu.RLock()
+	term := rf.term
+	log := rf.log
+	rf.mu.RUnlock()
 
 	// if some older leader sends messages, disregard
 	if message.Term < term {
@@ -243,6 +276,37 @@ func (rf *Raft) AppendEntry(message *AppendEntryArgs, reply *AppendEntryReply) {
 
 		return
 	}
+
+	// If this instance's log is empty simply accept whatever the leader sends
+	if len(log) == 0 {
+
+		rf.mu.Lock()
+		rf.log = append(log, message.Entries...)
+		rf.lastApplied = len(rf.log)
+		if message.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(rf.commitIndex, len(rf.log))
+		}
+		rf.mu.Unlock()
+
+		reply.Term = term
+		reply.Success = true
+
+		return
+	}
+
+	//Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+	prevLeaderLogEntry := log[message.PrevLogIndex]
+	if prevLeaderLogEntry.Term != log[rf.lastApplied].Term {
+		reply.Term = term
+		reply.Success = false
+
+		return
+	}
+
+	// Append new log entries
+	rf.mu.Lock()
+	rf.log = append(log, message.Entries...)
+	rf.mu.Unlock()
 
 	reply.Term = term
 	reply.Success = true
@@ -318,8 +382,6 @@ func (rf *Raft) maybeRequestVote() {
 					votesReceived++
 				}
 			case <-time.After(1 * time.Second):
-				println(fmt.Sprintf("Instance %d vote tally timed out", rf.me))
-
 				continue
 			}
 
@@ -341,9 +403,12 @@ func (rf *Raft) maybeRequestVote() {
 
 // Start will initiate a vote to commit a new log entry
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+
+	index := rf.lastApplied
+	term := rf.term
+	isLeader := rf.isLeader
 
 	// Your code here (2B).
 
@@ -376,10 +441,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.votedFor = -1
-	rf.term = 0
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.votedFor = -1
+	rf.term = 0
+	rf.isLeader = false
+	rf.lastApplied = 0
+	rf.commitIndex = 0
+
 	electionTimeoutBase, _ := time.ParseDuration(fmt.Sprintf("%dms", 150))
 	electionTimeoutJitter, _ := time.ParseDuration(fmt.Sprintf("%dms", rand.Intn(50)))
 	rf.electionTimeout = electionTimeoutBase + electionTimeoutJitter
