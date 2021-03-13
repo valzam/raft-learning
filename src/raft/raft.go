@@ -41,15 +41,11 @@ type Raft struct {
 }
 
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term = rf.currentTerm
-	isleader = rf.currentState == 2
+
+	term := rf.currentTerm
+	isleader := rf.currentState == 2
 
 	return term, isleader
 }
@@ -174,7 +170,7 @@ func (rf *Raft) maybeStartElection() {
 				}
 			}
 
-			for range rf.peers {
+			for j := 1; j < len(rf.peers); j++ {
 				select {
 				case vote := <-tally:
 					if vote {
@@ -183,21 +179,24 @@ func (rf *Raft) maybeStartElection() {
 				case <-time.After(250 * time.Millisecond):
 					continue
 				}
-
-				// Become leader if got enough votes and server hasn't turned into follower during election
-				if votesReceived >= (len(rf.peers)/2)+1 && rf.currentState > 0 {
-					rf.currentState = 2
-
-					rf.sendHeartbeat()
-					println(fmt.Sprintf("Instance %d became leader", rf.me))
-					break
-				}
 			}
+
+			// Become leader if got enough votes and server hasn't turned into follower during election
+			rf.mu.Lock()
+			if votesReceived >= (len(rf.peers)/2)+1 && rf.currentState > 0 {
+				rf.currentState = 2
+
+				go rf.sendHeartbeat(rf.currentTerm)
+				println(fmt.Sprintf("Instance %d became leader", rf.me))
+			}
+			rf.mu.Unlock()
 
 			// Failed to become leader
 			if rf.currentState != 2 {
 				println(fmt.Sprintf("Server %d failed to become leader", rf.me))
+				rf.mu.Lock()
 				rf.votedFor = -1
+				rf.mu.Unlock()
 
 				// Potentially failed because of collision, add random backoff
 				backoff, _ := time.ParseDuration(fmt.Sprintf("%dms", rand.Intn(100)))
@@ -210,24 +209,31 @@ func (rf *Raft) maybeStartElection() {
 
 func (rf *Raft) maybeSendHeartbeat() {
 	for {
-		if rf.currentState == 2 {
-			rf.sendHeartbeat()
+		rf.mu.Lock()
+		isLeader := rf.currentState == 2
+		currentTerm := rf.currentTerm
+		rf.mu.Unlock()
+
+		if isLeader {
+			rf.sendHeartbeat(currentTerm)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (rf *Raft) sendHeartbeat(forTerm int) {
 	args := &AppendEntriesArgs{}
 	args.LeaderId = rf.me
-	args.Term = rf.currentTerm
+	args.Term = forTerm
 
 	for peer := range rf.peers {
 		if peer != rf.me {
 			reply := &AppendEntriesReply{}
 			go rf.sendAppendEntries(peer, args, reply)
 		}
+
 	}
+
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
