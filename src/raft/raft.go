@@ -180,7 +180,7 @@ func (rf *Raft) maybeStartElection() {
 					if vote {
 						votesReceived++
 					}
-				case <-time.After(1 * time.Second):
+				case <-time.After(250 * time.Millisecond):
 					continue
 				}
 
@@ -259,8 +259,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	electionTimeoutBase, _ := time.ParseDuration(fmt.Sprintf("%dms", 300))
-	electionTimeoutJitter, _ := time.ParseDuration(fmt.Sprintf("%dms", rand.Intn(200)))
+	electionTimeoutBase, _ := time.ParseDuration(fmt.Sprintf("%dms", 200))
+	electionTimeoutJitter, _ := time.ParseDuration(fmt.Sprintf("%dms", rand.Intn(100)))
 	rf.electionTimeout = electionTimeoutBase + electionTimeoutJitter
 	rf.lastHeardFromLeader = time.Now()
 	rf.votedFor = -1
