@@ -18,14 +18,6 @@ func min(a int, b int) int {
 	}
 }
 
-func max(a int, b int) int {
-	if a >= b {
-		return a
-	} else {
-		return b
-	}
-}
-
 // import "bytes"
 // import "../labgob"
 
@@ -48,24 +40,24 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh   chan ApplyMsg
 
-	log []*LogEntry
+	log []LogEntry
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	// Raft metadata
+	// Election metadata
 	currentTerm         int
 	currentState        int // 0 follower, 1 candidate, 2 leader
 	votedFor            int
 	electionTimeout     time.Duration
 	lastHeardFromLeader time.Time
 
-	// Log replication data
+	// Log replicatio metadata
 	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-	nextIndex   []int
-	matchIndex  []int
+	nextIndex   [10]int
+	matchIndex  [10]int
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -85,12 +77,18 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int
 	LeaderCommit int
 
-	Entries []*LogEntry
+	Entries []LogEntry
 }
 
 type AppendEntriesReply struct {
 	Term    int  // currentTerm of follower
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+type RetryAppendEntries struct {
+	followerId        int
+	needsRetry        bool
+	needsPreviousLogs bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -134,7 +132,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
 	return ok
+}
+
+// Async function to replicate logs to followers
+// Accept: followerId, args to be replicated, built up by leader
+// Deals with
+// - Making RPC call
+// - Check if network error --> retry
+// - Check if log inconsistency --> Decrement nextIndex and retry
+// - If successful return true on resultCh
+
+func (rf *Raft) replicateLogEntries(server int, args AppendEntriesArgs, resultCh chan bool) {
+
+	for {
+		// Follower already has up2date logs
+		if args.PrevLogIndex < rf.nextIndex[server] {
+			break
+		}
+
+		reply := &AppendEntriesReply{}
+		// Send all entries from nextIndex to the end
+		args.Entries = rf.log[rf.nextIndex[server]:]
+
+		ok := rf.sendAppendEntries(server, &args, reply)
+		if ok {
+			// Follower was reachable but found a conflict
+			if !reply.Success {
+				rf.nextIndex[server]--
+				args.PrevLogIndex--
+				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+				// Follower was reachable and added the log entries
+			} else if reply.Success {
+				rf.nextIndex[server] = len(rf.log) + 1
+				resultCh <- true
+				break
+			}
+		}
+		// Small backoff then retry
+		time.Sleep(25 * time.Millisecond)
+
+	}
 }
 
 type RequestVoteArgs struct {
@@ -231,6 +270,11 @@ func (rf *Raft) maybeStartElection() {
 			rf.mu.Lock()
 			if votesReceived >= (len(rf.peers)/2)+1 && rf.currentState > 0 {
 				rf.currentState = 2
+				nextIndexToSend := len(rf.log) + 1
+				for i := range rf.peers {
+					rf.nextIndex[i] = nextIndexToSend
+					rf.matchIndex[i] = 0
+				}
 				currentCommitIndex := rf.commitIndex
 
 				go rf.sendHeartbeat(rf.currentTerm, currentCommitIndex)
@@ -298,36 +342,53 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	logEntry := &LogEntry{}
-	logEntry.Command = command
-	logEntry.Term = term
+	logEntry := LogEntry{command, term}
 
-	args := &AppendEntriesArgs{}
-	args.Entries = []*LogEntry{logEntry}
+	// Build payload for follower RPC
+	args := AppendEntriesArgs{}
 	args.LeaderCommit = rf.commitIndex
 	args.LeaderId = rf.me
-
-	rf.log = append(rf.log, logEntry)
-	rf.applyCh <- ApplyMsg{true, command, len(rf.log)}
+	args.Term = term
 
 	if len(rf.log) > 0 {
+		// Get the current head of the log
 		args.PrevLogIndex = len(rf.log)
-		args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 	} else {
 		args.PrevLogIndex = -1
 		args.PrevLogTerm = term
 	}
-	args.Term = term
 
+	// Add to own log
+	rf.log = append(rf.log, logEntry)
+	rf.applyCh <- ApplyMsg{true, command, len(rf.log)}
+
+	// Send entries to followers and gather responses
+	resultCh := make(chan bool)
 	for peer := range rf.peers {
 		if peer != rf.me {
-			reply := &AppendEntriesReply{}
-
-			rf.sendAppendEntries(peer, args, reply)
+			go rf.replicateLogEntries(peer, args, resultCh)
 		}
 	}
 
-	rf.commitIndex++
+	// Get all follower replies with retry flag
+	successfulReplication := 1
+	for j := 1; j < len(rf.peers); j++ {
+		select {
+		case response := <-resultCh:
+			if response {
+				successfulReplication++
+			}
+		case <-time.After(500 * time.Millisecond):
+			continue
+		}
+	}
+
+	if successfulReplication >= (len(rf.peers)/2)+1 {
+		rf.commitIndex++
+		rf.lastApplied++
+	}
+
 	index := rf.commitIndex
 	println(fmt.Sprintf("Server %d applied command at index %d", rf.me, rf.commitIndex))
 
