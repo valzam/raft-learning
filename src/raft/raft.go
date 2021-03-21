@@ -502,7 +502,7 @@ func (rf *Raft) sendHeartbeat(forTerm int, withCommitIndex int) {
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-
+	//%% TODO: Refactor to only send message if log entry gets commited
 	if rf.killed() {
 		return rf.commitIndex, rf.currentTerm, false
 	}
