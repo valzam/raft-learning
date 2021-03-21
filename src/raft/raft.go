@@ -165,12 +165,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	t := time.Now()
 	rf.lastHeardFromLeader = t
 
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if len(args.Entries) > 0 {
+		println(fmt.Sprintf("Server %d got AppendEntriesRPC call %+v", rf.me, args))
+
+	}
 
 	// Leader is in old term, ignore message
 	if args.Term < rf.currentTerm {
-		println(fmt.Sprintf("Server %d refused to apply entries", rf.me))
+		println(fmt.Sprintf("Server %d received message from past term, refused to accept", rf.me))
 
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -181,13 +183,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentState > 0 {
 		println(fmt.Sprintf("Server %d converted to follower", rf.me))
 	}
+	rf.mu.Lock()
 	rf.currentTerm = args.Term
 	rf.currentState = 0
+	rf.mu.Unlock()
 
 	// Maybe increment commit index
 	if args.LeaderCommit > rf.commitIndex {
 		newCommitIndex := min(args.LeaderCommit, rf.log.length())
+
+		rf.mu.Lock()
 		rf.commitIndex = newCommitIndex
+		rf.mu.Unlock()
+
 		println(fmt.Sprintf("Server %d moved commit index forward to %d", rf.me, newCommitIndex))
 	}
 
@@ -201,6 +209,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Short curcuit for special case: Follower has empty log
 	// This makes later code simpler
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.log.length() == 0 {
 		println(fmt.Sprintf("Server %d started with empty log", rf.me))
 
@@ -217,8 +227,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	println(fmt.Sprintf("Server %d received new entries from leader", rf.me))
 
 	// Is the last known entry the same as on the leader? --> Request previous logs
+	// If PrevLogIndex cannot be found (most likely out of bounds) also request previous logs
 	lastEntry, ok := rf.log.getEntry(args.PrevLogIndex)
-	if ok && lastEntry.Term != args.PrevLogTerm {
+	if !ok || (ok && lastEntry.Term != args.PrevLogTerm) {
 		println(fmt.Sprintf("Server %d found conflicting history", rf.me))
 
 		reply.Term = rf.currentTerm
@@ -230,15 +241,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
+	newestIndex := rf.log.length() + 1
 	// Simple version: Overwrite any overlap, append rest
 	rf.log.overwriteEntries(args.Entries, args.PrevLogIndex+1)
 
-	rf.applyCh <- ApplyMsg{true, args.Entries[0].Command, rf.log.length()}
+	for _, entry := range args.Entries {
+		rf.applyCh <- ApplyMsg{true, entry.Command, newestIndex}
+		newestIndex++
+	}
 
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	if ok && reply.Term > rf.currentTerm {
+		println(fmt.Sprintf("Server %d converted to follower", rf.me))
+
+		rf.mu.Lock()
+		rf.currentTerm = reply.Term
+		rf.currentState = 0
+		rf.mu.Unlock()
+
+		return false
+	}
 
 	return ok
 }
@@ -252,20 +278,25 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // - If successful return true on resultCh
 
 func (rf *Raft) replicateLogEntries(server int, args AppendEntriesArgs, resultCh chan bool) {
-	println(fmt.Sprintf("Trying to send log to server %d", server))
-
 	for {
-		// // Follower already has up2date logs
-		// if args.PrevLogIndex >= rf.nextIndex[server]               {
-		// 	println(fmt.Sprintf("Server %d already has current log state", server))
+		println(fmt.Sprintf("Trying to send log to server %d for term %d", server, rf.currentTerm))
 
-		// 	break
-		// }
+		// Lost the leadership at some point, stop sending
+		if !rf.isLeader() {
+			break
+		}
+
+		// Follower already has up2date logs, don't try sending
+		if args.PrevLogIndex+1 < rf.nextIndex[server] {
+			println(fmt.Sprintf("Server %d already has current log state", server))
+
+			break
+		}
 
 		// Follower is behind, allow to catch up
-		// if args.PrevLogIndex >= rf.nextIndex[server] {
-		// 	args.PrevLogIndex = rf.nextIndex[server] - 1
-		// }
+		if args.PrevLogIndex >= rf.nextIndex[server] {
+			args.PrevLogIndex = rf.nextIndex[server] - 1
+		}
 
 		reply := &AppendEntriesReply{}
 		// Send all entries from nextIndex to the end
@@ -277,13 +308,14 @@ func (rf *Raft) replicateLogEntries(server int, args AppendEntriesArgs, resultCh
 			if !reply.Success {
 				println(fmt.Sprintf("Server %d was reachable but found a conflict", server))
 
-				rf.nextIndex[server]--
-				args.PrevLogIndex--
-				lastEntry, ok := rf.log.getEntry(rf.log.length())
+				rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1)
+				args.PrevLogIndex = max(args.PrevLogTerm-1, 1)
+				lastEntry, ok := rf.log.getEntry(args.PrevLogIndex)
 				if ok {
 					args.PrevLogTerm = lastEntry.Term
 				} else {
 					println(fmt.Sprintf("Server %d could not accept replication", server))
+					println(fmt.Sprintf("Log state on leader %+v", rf.log))
 					break
 				}
 				// Follower was reachable and added the log entries
@@ -340,6 +372,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, resultCh chan bool) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
+	if ok && reply.Term > rf.currentTerm {
+		println(fmt.Sprintf("Server %d converted to follower", rf.me))
+
+		rf.mu.Lock()
+		rf.currentTerm = reply.Term
+		rf.currentState = 0
+		rf.mu.Unlock()
+	}
+
 	if ok {
 		resultCh <- reply.VoteGranted
 	}
@@ -349,6 +390,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) maybeStartElection() {
 	for {
+		if rf.killed() {
+			break
+		}
+
 		t := time.Now()
 
 		rf.mu.Lock()
@@ -427,6 +472,9 @@ func (rf *Raft) maybeStartElection() {
 
 func (rf *Raft) maybeSendHeartbeat() {
 	for {
+		if rf.killed() {
+			break
+		}
 		if rf.isLeader() {
 			rf.mu.Lock()
 			currentTerm := rf.currentTerm
@@ -454,6 +502,10 @@ func (rf *Raft) sendHeartbeat(forTerm int, withCommitIndex int) {
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
+	if rf.killed() {
+		return rf.commitIndex, rf.currentTerm, false
+	}
 
 	rf.mu.Lock()
 	term := rf.currentTerm
@@ -519,9 +571,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		rf.mu.Unlock()
 		println(fmt.Sprintf("Server %d applied command at index %d", rf.me, rf.commitIndex))
+	} else {
+		print(fmt.Sprintf("Leader wrote command at index %d to log but didn't commit", rf.log.length()))
 	}
 
-	return rf.commitIndex, term, isLeader
+	return rf.log.length(), term, isLeader
 }
 
 func (rf *Raft) Kill() {
