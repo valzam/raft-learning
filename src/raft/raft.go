@@ -49,11 +49,11 @@ func (log *Log) getEntry(index int) (*LogEntry, bool) {
 	log.mu.Lock()
 	defer log.mu.Unlock()
 
-	if index == 0 || len(log.entries) < index {
+	if index == 0 || log.length() < index {
 		return &LogEntry{}, false
 	}
 
-	return &log.entries[index-1], true
+	return &log.entries[index], true
 }
 
 func (log *Log) getAllEntriesFrom(index int) []LogEntry {
@@ -64,7 +64,7 @@ func (log *Log) getAllEntriesFrom(index int) []LogEntry {
 		return []LogEntry{}
 	}
 
-	return log.entries[index-1:]
+	return log.entries[index:]
 }
 
 func (log *Log) putEntry(entry LogEntry) (int, bool) {
@@ -91,11 +91,10 @@ func (log *Log) overwriteEntries(entries []LogEntry, from int) (int, bool) {
 	return len(log.entries), true
 }
 
+// Raft expects 1-indexed arrays
+// During initialization we add a dummy value and pretend it doesn't exist
 func (log *Log) length() int {
-	log.mu.Lock()
-	defer log.mu.Unlock()
-
-	return len(log.entries)
+	return max(len(log.entries)-1, 0)
 }
 
 type Raft struct {
@@ -232,7 +231,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	// Simple version: Overwrite any overlap, append rest
-	rf.log.overwriteEntries(args.Entries, args.PrevLogIndex)
+	rf.log.overwriteEntries(args.Entries, args.PrevLogIndex+1)
 
 	rf.applyCh <- ApplyMsg{true, args.Entries[0].Command, rf.log.length()}
 
@@ -468,7 +467,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	logEntry := LogEntry{command, term}
-	println(fmt.Sprintf("Server %d sending log entry %+v", rf.me, logEntry))
 
 	// Build payload for follower RPC
 	args := AppendEntriesArgs{}
@@ -488,8 +486,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// Add to own log
 	rf.log.appendEntries([]LogEntry{logEntry})
-
 	rf.applyCh <- ApplyMsg{true, command, rf.log.length()}
+
+	println(fmt.Sprintf("Server %d sending log entry %+v", rf.me, logEntry))
 
 	// Send entries to followers and gather responses
 	resultCh := make(chan bool)
@@ -544,6 +543,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCh = applyCh
 	rf.log = &Log{}
+	rf.log.appendEntries([]LogEntry{LogEntry{}})
 
 	// Your initialization code here (2A, 2B, 2C).
 	electionTimeoutBase, _ := time.ParseDuration(fmt.Sprintf("%dms", 150))
