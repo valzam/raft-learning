@@ -18,6 +18,14 @@ func min(a int, b int) int {
 	}
 }
 
+func max(a int, b int) int {
+	if a >= b {
+		return a
+	} else {
+		return b
+	}
+}
+
 // import "bytes"
 // import "../labgob"
 
@@ -41,7 +49,7 @@ func (log *Log) getEntry(index int) (*LogEntry, bool) {
 	log.mu.Lock()
 	defer log.mu.Unlock()
 
-	if len(log.entries) < index {
+	if index == 0 || len(log.entries) < index {
 		return &LogEntry{}, false
 	}
 
@@ -67,11 +75,19 @@ func (log *Log) putEntry(entry LogEntry) (int, bool) {
 	return len(log.entries), true
 }
 
-func (log *Log) putEntries(entries []LogEntry) (int, bool) {
+func (log *Log) appendEntries(entries []LogEntry) (int, bool) {
 	log.mu.Lock()
 	defer log.mu.Unlock()
 
 	log.entries = append(log.entries, entries...)
+	return len(log.entries), true
+}
+
+func (log *Log) overwriteEntries(entries []LogEntry, from int) (int, bool) {
+	log.mu.Lock()
+	defer log.mu.Unlock()
+
+	log.entries = append(log.entries[:from], entries...)
 	return len(log.entries), true
 }
 
@@ -149,42 +165,77 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Your code here (2A, 2B).
 	t := time.Now()
 	rf.lastHeardFromLeader = t
-	// println(fmt.Sprintf("Server %d received AppendEntries RPC with args %+v", rf.me, args))
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term >= rf.currentTerm {
-		if rf.currentState > 0 {
-			println(fmt.Sprintf("Server %d converted to follower", rf.me))
-		}
-		rf.currentTerm = args.Term
-		rf.currentState = 0
-
-		// TODO: Reply false if last log entry of follower differs from leader
-		// TODO: Remove conflicting entries from follower log
-		if len(args.Entries) > 0 {
-			println(fmt.Sprintf("Server %d received new entries from leader", rf.me))
-			rf.log.putEntries(args.Entries)
-			rf.applyCh <- ApplyMsg{true, args.Entries[0].Command, rf.log.length()}
-		}
-
-		if args.LeaderCommit > rf.commitIndex {
-			newCommitIndex := min(args.LeaderCommit, rf.log.length())
-			println(fmt.Sprintf("Server %d moved commit index forward to %d", rf.me, newCommitIndex))
-			rf.commitIndex = newCommitIndex
-		}
-
-		reply.Term = rf.currentTerm
-		reply.Success = true
-
-		// Leader is in old term
-	} else {
+	// Leader is in old term, ignore message
+	if args.Term < rf.currentTerm {
 		println(fmt.Sprintf("Server %d refused to apply entries", rf.me))
 
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		return
 	}
+
+	// This server thinks it's the leader, convert to follower
+	if rf.currentState > 0 {
+		println(fmt.Sprintf("Server %d converted to follower", rf.me))
+	}
+	rf.currentTerm = args.Term
+	rf.currentState = 0
+
+	// Maybe increment commit index
+	if args.LeaderCommit > rf.commitIndex {
+		newCommitIndex := min(args.LeaderCommit, rf.log.length())
+		rf.commitIndex = newCommitIndex
+		println(fmt.Sprintf("Server %d moved commit index forward to %d", rf.me, newCommitIndex))
+	}
+
+	// Short curcuit for empty messages / heartbeat messages
+	if len(args.Entries) == 0 {
+		reply.Term = rf.currentTerm
+		reply.Success = true
+
+		return
+	}
+
+	// Short curcuit for special case: Follower has empty log
+	// This makes later code simpler
+	if rf.log.length() == 0 {
+		println(fmt.Sprintf("Server %d started with empty log", rf.me))
+
+		rf.log.appendEntries(args.Entries)
+		reply.Term = rf.currentTerm
+		reply.Success = true
+		rf.applyCh <- ApplyMsg{true, args.Entries[0].Command, rf.log.length()}
+
+		return
+	}
+
+	// Leader is sending new logs and follower already has log entries
+
+	println(fmt.Sprintf("Server %d received new entries from leader", rf.me))
+
+	// Is the last known entry the same as on the leader? --> Request previous logs
+	lastEntry, ok := rf.log.getEntry(args.PrevLogIndex)
+	if ok && lastEntry.Term != args.PrevLogTerm {
+		println(fmt.Sprintf("Server %d found conflicting history", rf.me))
+
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// All good, apply logs
+	reply.Term = rf.currentTerm
+	reply.Success = true
+
+	// Simple version: Overwrite any overlap, append rest
+	rf.log.overwriteEntries(args.Entries, args.PrevLogIndex)
+
+	rf.applyCh <- ApplyMsg{true, args.Entries[0].Command, rf.log.length()}
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -210,6 +261,11 @@ func (rf *Raft) replicateLogEntries(server int, args AppendEntriesArgs, resultCh
 		// 	println(fmt.Sprintf("Server %d already has current log state", server))
 
 		// 	break
+		// }
+
+		// Follower is behind, allow to catch up
+		// if args.PrevLogIndex >= rf.nextIndex[server] {
+		// 	args.PrevLogIndex = rf.nextIndex[server] - 1
 		// }
 
 		reply := &AppendEntriesReply{}
@@ -377,6 +433,7 @@ func (rf *Raft) maybeSendHeartbeat() {
 			currentTerm := rf.currentTerm
 			currentCommitIndex := rf.commitIndex
 			rf.mu.Unlock()
+
 			rf.sendHeartbeat(currentTerm, currentCommitIndex)
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -421,10 +478,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	args.PrevLogIndex = 0
 	args.PrevLogTerm = term
 
-	// Add to own log
-	rf.log.putEntry(logEntry)
-
-	if rf.log.length() > 1 {
+	if rf.log.length() >= 1 {
 		// Get the current head of the log
 		args.PrevLogIndex = rf.log.length()
 		lastEntry, ok := rf.log.getEntry(rf.log.length())
@@ -432,6 +486,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			args.PrevLogTerm = lastEntry.Term
 		}
 	}
+	// Add to own log
+	rf.log.appendEntries([]LogEntry{logEntry})
 
 	rf.applyCh <- ApplyMsg{true, command, rf.log.length()}
 
@@ -457,14 +513,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	if successfulReplication >= (len(rf.peers)/2)+1 {
-		println(fmt.Sprintf("Server %d applied command at index %d", rf.me, rf.commitIndex))
 		rf.mu.Lock()
 
 		rf.commitIndex++
 		rf.lastApplied++
 
 		rf.mu.Unlock()
-
+		println(fmt.Sprintf("Server %d applied command at index %d", rf.me, rf.commitIndex))
 	}
 
 	return rf.commitIndex, term, isLeader
